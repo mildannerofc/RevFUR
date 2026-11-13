@@ -260,7 +260,3 @@ The modern v240 test is a synthetic fixture built from the published Furnace for
 - [Furnace pattern effects](https://github.com/tildearrow/furnace/blob/master/doc/3-pattern/effects.md)
 - [Furnace instrument format](https://github.com/tildearrow/furnace/blob/master/papers/newIns.md)
 - RevSMPS reference: the supplied `RevSMPS.exe` was inspected locally; no RevSMPS source code or executable is included in this project.
-
-## Version
-
-RevFUR 0.1.5 — complete-sequence isolated one-tick gap compaction, safe multi-channel alignment and optional whole-song `0B00` loop-back.
