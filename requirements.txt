@@ -1,0 +1,3 @@
+# Optional: enables native drag-and-drop in the Tkinter desktop interface.
+tkinterdnd2>=0.4.2
+# PyInstaller is only needed when building standalone executables.

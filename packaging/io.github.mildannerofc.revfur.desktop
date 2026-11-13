@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=RevFUR
+Comment=Reverse and edit Furnace Tracker song sequences
+Exec=revfur
+Terminal=false
+Categories=AudioVideo;Audio;Midi;Utility;
