@@ -765,6 +765,8 @@ def apply_sequence(input_path: Path, sequence_path: Path, output_path: Optional[
         raise fur2mid.FurFormatError("Patterns must be a list")
     seen_keys = set()
     changed_patterns = 0
+    added_patterns = 0
+    new_pattern_ptrs: List[int] = []
     append_cursor = len(new_data)
     for pattern_doc in patterns_doc:
         if not isinstance(pattern_doc, dict):
@@ -772,11 +774,41 @@ def apply_sequence(input_path: Path, sequence_path: Path, output_path: Optional[
         key = (int(pattern_doc.get("subsong", 0)), int(pattern_doc.get("channel", -1)), int(pattern_doc.get("index", -1)))
         if key[0] != 0:
             raise fur2mid.FurFormatError("RevFUR currently edits the first subsong only")
+        if not 0 <= key[1] < song.channel_count or not 0 <= key[2] <= 255:
+            raise fur2mid.FurFormatError("Pattern channel/index is outside Furnace limits")
         if key in seen_keys:
             raise fur2mid.FurFormatError("Duplicate pattern entry: %s" % (key,))
         seen_keys.add(key)
-        if key not in layout.pattern_pointer_indices:
-            raise fur2mid.FurFormatError("Pattern %s does not exist in the source module" % (key,))
+
+        is_new_pattern = key not in layout.pattern_pointer_indices
+        if is_new_pattern:
+            # Reverse/repack may need a fresh pattern slot. New blocks are
+            # appended and the INFO/INF2 pointer list is extended through a
+            # relocated header, so all existing absolute asset pointers stay
+            # valid and no instrument/sample/wavetable block is moved.
+            rows = _normalise_rows(pattern_doc, song.subsong.pattern_length, layout.version)
+            max_effects = (song.subsong.effect_columns[key[1]]
+                           if key[1] < len(song.subsong.effect_columns) else 1)
+            if any(len(cell.effects) > max_effects for cell in rows.values()):
+                raise fur2mid.FurFormatError(
+                    "Pattern %s exceeds its channel effect-column limit (%d)" % (key, max_effects)
+                )
+            if layout.version >= 157:
+                replacement = _encode_patn(key[0], key[1], key[2], str(pattern_doc.get("name", "")),
+                                            rows, song.subsong.pattern_length, layout.version)
+            else:
+                cols = song.subsong.effect_columns[key[1]] if key[1] < len(song.subsong.effect_columns) else 1
+                replacement = _encode_patr(key[0], key[1], key[2], str(pattern_doc.get("name", "")), rows,
+                                            song.subsong.pattern_length, cols, layout.version)
+            new_ptr = append_cursor
+            new_data.extend(replacement)
+            append_cursor += len(replacement)
+            new_pattern_ptrs.append(new_ptr)
+            added_patterns += 1
+            _log(log, "Created channel %d pattern %02X (new block at 0x%X)." % (
+                key[1] + 1, key[2], new_ptr))
+            continue
+
         ptr_index = layout.pattern_pointer_indices[key]
         old_ptr, old_block = layout.pattern_blocks[key]
         if pattern_doc.get("source_block_sha256") != _sha(old_block):
@@ -810,12 +842,48 @@ def apply_sequence(input_path: Path, sequence_path: Path, output_path: Optional[
         changed_patterns += 1
         _log(log, "Updated channel %d pattern %02X (new block at 0x%X)." % (key[1] + 1, key[2], new_ptr))
 
-    # Export includes each pattern from the first subsong. Missing entries are
-    # rejected to avoid accidentally dropping the source's sequence patterns.
+    # Export includes every original first-subsong pattern. Reverse/repack may
+    # additionally supply newly allocated patterns; it may never silently drop
+    # an original pointer entry.
     first_subsong_keys = {key for key in layout.pattern_pointer_indices if key[0] == 0}
     exported_keys = {(int(p.get("subsong", 0)), int(p.get("channel", -1)), int(p.get("index", -1))) for p in patterns_doc}
-    if first_subsong_keys != exported_keys:
+    if not first_subsong_keys.issubset(exported_keys):
         raise fur2mid.FurFormatError("Sequence JSON must retain every original first-subsong pattern entry")
+
+    if new_pattern_ptrs:
+        info_size = struct.unpack_from("<I", new_data, layout.info_pos + 4)[0]
+        info_end = layout.info_pos + 8 + info_size
+        if info_end > len(new_data):
+            raise fur2mid.FurFormatError("INFO/INF2 block extends beyond the source module")
+        info_block = bytearray(new_data[layout.info_pos:info_end])
+        relative_ptr_table = layout.pattern_pointer_table_offset - layout.info_pos
+        if layout.version >= 240:
+            count_offset = relative_ptr_table - 4
+        else:
+            # Legacy INFO stores the global pattern count in its fixed header,
+            # before the system definitions and the later pointer arrays.
+            count_offset = 28
+        if count_offset < 8 or count_offset + 4 > len(info_block):
+            raise fur2mid.FurFormatError("Could not locate the Furnace pattern-pointer count")
+        old_count = struct.unpack_from("<I", info_block, count_offset)[0]
+        if old_count != len(layout.pattern_ptrs):
+            raise fur2mid.FurFormatError("Furnace pattern-pointer count changed unexpectedly")
+        insert_at = relative_ptr_table + old_count * 4
+        pointer_bytes = b"".join(struct.pack("<I", ptr) for ptr in new_pattern_ptrs)
+        if insert_at < 8 or insert_at > len(info_block):
+            raise fur2mid.FurFormatError("Pattern-pointer table is outside the INFO/INF2 block")
+        info_block[insert_at:insert_at] = pointer_bytes
+        struct.pack_into("<I", info_block, count_offset, old_count + len(new_pattern_ptrs))
+        struct.pack_into("<I", info_block, 4, len(info_block) - 8)
+        new_info_pos = len(new_data)
+        new_data.extend(info_block)
+        # The header's song-info pointer is at byte offset 20. The relocated
+        # header continues to reference every original asset/subsong block at
+        # its untouched absolute offset.
+        struct.pack_into("<I", new_data, 20, new_info_pos)
+        _log(log, "Extended Furnace pattern table with %d new pattern block(s)." % len(new_pattern_ptrs))
+
+    changed_patterns += added_patterns
 
     # Asset blocks are checked byte-for-byte before writing. Only the order
     # table and pattern pointers are patched; original assets remain untouched.
@@ -856,6 +924,7 @@ def apply_sequence(input_path: Path, sequence_path: Path, output_path: Optional[
         "fur_version": layout.version,
         "orders_changed": order_changed,
         "patterns_replaced": changed_patterns,
+        "patterns_added": added_patterns,
         "instruments_unchanged": True,
         "wavetables_unchanged": True,
         "samples_unchanged": True,
@@ -1116,7 +1185,7 @@ def _row_document_has_playback_data(row_item: Optional[Dict[str, Any]]) -> bool:
 
     Notes (including OFF/REL), instrument and volume changes, raw frequencies,
     and all non-flow effects count as real sequence data. 0B/0D/FF alone do not:
-    those commands are regenerated at the reversed segment boundaries.
+    source navigation is removed when the reversed stream is repacked.
     """
     if row_item is None:
         return False
@@ -1174,7 +1243,8 @@ def count_isolated_empty_ticks(layout: FurLayout,
     playback_states = analysis.states if analysis is not None else states
     song = layout.song
     flags = []
-    for order_index, row_index in playback_states:
+    terminal_state = playback_states[-1] if playback_states else None
+    for state_index, (order_index, row_index) in enumerate(playback_states):
         has_data = False
         for channel in range(song.channel_count):
             pattern_index = song.subsong.orders[channel][order_index]
@@ -1187,6 +1257,13 @@ def count_isolated_empty_ticks(layout: FurLayout,
                 break
             if any((int(command) & 0xFF) not in (0x0B, 0x0D, 0xFF)
                    for command, _value in cell.effects):
+                has_data = True
+                break
+            # A terminal FFxx/0Bxx is a structural end marker, not an empty
+            # musical tick. Do not report it as a one-tick silence gap.
+            if (state_index == len(playback_states) - 1 and
+                    any((int(command) & 0xFF) in (0x0B, 0xFF)
+                        for command, _value in cell.effects)):
                 has_data = True
                 break
         flags.append(not has_data)
@@ -1205,18 +1282,54 @@ def count_isolated_empty_ticks(layout: FurLayout,
     return count
 
 
+def _note_stream(path: Path) -> List[Tuple[Any, ...]]:
+    """Return the note values of every playback tick, in playback order.
+
+    Used to verify a reversed module against the reversal of its source. Only
+    note values are compared: instrument and volume values may be legitimately
+    filled in by reverse mode to restore inherited state.
+    """
+    import tempfile
+    json_path = Path(tempfile.mkdtemp(prefix="revfur_verify_")) / "verify.furseq.json"
+    export_sequence(Path(path), json_path, lambda *a, **k: None)
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    seq = doc["sequence"]
+    patterns = {(p["channel"], p["index"]): {int(r["row"]): r for r in p["rows"]} for p in seq["patterns"]}
+    analysis = analyze_playback(inspect_fur(Path(path)))
+    stream = []
+    for order_index, row_index in analysis.states:
+        tick = []
+        for channel in range(seq["channel_count"]):
+            pattern_index = seq["orders"][channel][order_index]
+            cell = patterns.get((channel, pattern_index), {}).get(row_index)
+            tick.append(None if cell is None else cell.get("note"))
+        stream.append(tuple(tick))
+    return stream
+
+
 def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None,
                             log: Optional[LOG] = None,
-                            loop_back_to_start: bool = False) -> Dict[str, Any]:
-    """Reverse the reachable Furnace playback path, automatically handling flow.
+                            loop_back_to_start: bool = False,
+                            compact_empty_ticks: bool = False,
+                            trim_boundary_empty_ticks: bool = True) -> Dict[str, Any]:
+    """Reverse the complete reachable playback stream and repack it into orders.
 
-    The sequence is first simulated row-by-row.  For a 0Bxx loop, one complete
-    intro plus one loop traversal is used as the finite source pass.  FFxx and
-    natural order-table completion define the actual source end.  Flow commands
-    are removed only from rows in that reachable path, and a new FF00 stop is
-    placed at the end of the reversed arrangement.  When loop_back_to_start is
-    enabled, a native 0B00 jump is written instead so Furnace loops the complete
-    reversed song from order 00 / row 00.
+    By default the musical timing is preserved exactly: every reachable tick,
+    including one-tick empty rows, is kept, so the reversed module has the same
+    length as the playback path of the source. Pass compact_empty_ticks=True to
+    additionally remove isolated one-tick empty rows (this shortens the song and
+    changes the rhythm, so it is opt-in).
+
+    trim_boundary_empty_ticks (default True) only removes empty or
+    navigation-only ticks at the start of the reversed arrangement, which is
+    the source's final played tick. Interior ticks are never touched by it.
+
+    Unlike the earlier segment-preserving implementation, this version does
+    not insert 0Dxx between partially filled source orders. It flattens the
+    reachable row stream, reverses it, removes only isolated one-tick gaps,
+    and repacks the result into full-length patterns. This avoids introducing
+    pattern-break commands into songs that never used them and also handles
+    source songs that do use 0Dxx.
     """
     import tempfile
 
@@ -1224,18 +1337,13 @@ def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None
     layout = inspect_fur(input_path, log)
     song = layout.song
     analysis = analyze_playback(layout, log)
-    if not analysis.states or not analysis.segments:
+    if not analysis.states:
         raise fur2mid.FurFormatError("No playable sequence rows were found")
-    if len(analysis.segments) > song.subsong.orders_length:
-        raise fur2mid.FurFormatError(
-            "The playback path revisits order positions in a way that requires pattern cloning. "
-            "This module cannot be safely reversed without adding new Furnace pattern slots."
-        )
 
     seq_len = song.subsong.orders_length
     pattern_len = song.subsong.pattern_length
     original_orders = [list(row) for row in song.subsong.orders]
-    _log(log, "Reversing %d reachable row events across %d channels." % (
+    _log(log, "Reversing %d reachable ticks across %d channels." % (
         len(analysis.states), song.channel_count))
 
     with tempfile.TemporaryDirectory(prefix="revfur_reverse_") as temp_dir:
@@ -1243,31 +1351,34 @@ def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None
         exported, _dump = export_sequence(input_path, sequence_path, log)
         document = json.loads(exported.read_text(encoding="utf-8"))
         seq = document["sequence"]
+        original_pattern_docs = seq["patterns"]
         patterns_by_key = {
             (int(item.get("channel", -1)), int(item.get("index", -1))): item
-            for item in seq["patterns"]
+            for item in original_pattern_docs
+        }
+        row_lookup_by_key = {
+            key: {int(item["row"]): item for item in pattern_doc.get("rows", [])}
+            for key, pattern_doc in patterns_by_key.items()
         }
 
-        # Resolve the stateful instrument/volume columns in real playback order,
-        # not by blindly scanning every stored order after a loop/end marker.
+        # Capture stateful instrument/volume values while walking the original
+        # song forward. A reversed note may no longer have its original setup
+        # row before it, so only the required references are materialised.
         desired_state: Dict[Tuple[int, int, int], Tuple[Optional[int], Optional[int]]] = {}
-        active_by_channel: List[Tuple[Optional[int], Optional[int]]] = [(None, None) for _ in range(song.channel_count)]
+        active_by_channel: List[Tuple[Optional[int], Optional[int]]] = [
+            (None, None) for _ in range(song.channel_count)
+        ]
         for order, source_row in analysis.states:
             for channel in range(song.channel_count):
                 pattern_index = original_orders[channel][order]
-                pattern_doc = patterns_by_key.get((channel, pattern_index))
-                if pattern_doc is None:
-                    continue
-                row_item = next((item for item in pattern_doc.get("rows", [])
-                                 if int(item["row"]) == source_row), None)
+                row_item = row_lookup_by_key.get((channel, pattern_index), {}).get(source_row)
                 active_instrument, active_volume = active_by_channel[channel]
                 if row_item is not None:
                     if "instrument" in row_item:
                         active_instrument = int(row_item["instrument"])
                     if "volume" in row_item:
                         active_volume = int(row_item["volume"])
-                    note = row_item.get("note")
-                    if _is_note_event(note):
+                    if _is_note_event(row_item.get("note")):
                         key = (channel, pattern_index, source_row)
                         state = (active_instrument, active_volume)
                         previous = desired_state.get(key)
@@ -1280,325 +1391,262 @@ def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None
                         desired_state[key] = state
                 active_by_channel[channel] = (active_instrument, active_volume)
 
-        # Compact isolated one-tick empty gaps across the complete reachable
-        # playback path. Multi-tick rests remain intact. A trailing run made
-        # only of navigation/empty rows is also removed from the new beginning,
-        # as in previous versions.
+        # The reverse starts at the final played source tick. Remove any
+        # trailing empty/navigation-only run there, then remove globally
+        # isolated one-tick gaps throughout the path. All channels are treated
+        # as a synchronized tick: a tick is kept if any channel has real data.
         reversed_source_segments = list(reversed(analysis.segments))
         first_segment = reversed_source_segments[0]
         first_order = int(first_segment["order"])
         first_start_row = int(first_segment["start_row"])
         first_end_row = int(first_segment["end_row"])
-        first_segment_keys = {
-            (channel, original_orders[channel][first_order])
-            for channel in range(song.channel_count)
-        }
         boundary_trim_rows = count_leading_navigation_ticks(
             patterns_by_key, original_orders, song.channel_count,
             first_order, first_start_row, first_end_row,
         )
-        # If the entire boundary order is an unallocated/empty pattern slot,
-        # keep its full pattern duration. There is nowhere to store a row-level
-        # navigation marker in that order, and it is a multi-tick silent order,
-        # not an isolated one-tick gap.
-        first_segment_has_data = False
-        for source_row in range(first_start_row, first_end_row + 1):
-            for channel in range(song.channel_count):
-                pattern_index = original_orders[channel][first_order]
-                pattern_doc = patterns_by_key.get((channel, pattern_index))
-                row_item = next((item for item in pattern_doc.get("rows", [])
-                                 if int(item["row"]) == source_row), None) if pattern_doc else None
-                if _row_document_has_playback_data(row_item):
-                    first_segment_has_data = True
-                    break
-            if first_segment_has_data:
-                break
+        first_segment_has_data = any(
+            _row_document_has_playback_data(
+                row_lookup_by_key.get((channel, original_orders[channel][first_order]), {}).get(source_row)
+            )
+            for source_row in range(first_start_row, first_end_row + 1)
+            for channel in range(song.channel_count)
+        )
         if not first_segment_has_data:
             boundary_trim_rows = 0
-        first_keys_are_unique = all(
-            sum(1 for segment in analysis.segments
-                if original_orders[channel][int(segment["order"])] == pattern_index) == 1
-            for channel, pattern_index in first_segment_keys
-        )
-        if not first_keys_are_unique:
-            boundary_trim_rows = 0
 
-        isolated_empty_states = find_isolated_empty_ticks(
-            analysis.states, patterns_by_key, original_orders, song.channel_count
-        )
+        if compact_empty_ticks:
+            isolated_empty_states = find_isolated_empty_ticks(
+                analysis.states, patterns_by_key, original_orders, song.channel_count
+            )
+        else:
+            isolated_empty_states = set()
+        if not trim_boundary_empty_ticks:
+            boundary_trim_rows = 0
         boundary_empty_states = {
-            (first_order, row_index)
-            for row_index in range(first_end_row - boundary_trim_rows + 1,
-                                   first_end_row + 1)
+            (first_order, source_row)
+            for source_row in range(first_end_row - boundary_trim_rows + 1, first_end_row + 1)
         } if boundary_trim_rows else set()
         removed_empty_states = isolated_empty_states | boundary_empty_states
-        if not removed_empty_states:
-            _log(log, "No isolated one-tick empty gaps were found in the reachable sequence.")
-        else:
-            _log(log, "Removed %d isolated one-tick empty gap(s) across the complete sequence." %
-                 len(isolated_empty_states))
-            extra_boundary = len(boundary_empty_states - isolated_empty_states)
-            if extra_boundary:
-                _log(log, "Also removed %d trailing navigation-only boundary tick(s) before the reversed start." %
-                     extra_boundary)
+        reversed_states = list(reversed(analysis.states))
+        output_source_states = [state for state in reversed_states if state not in removed_empty_states]
+        if not output_source_states:
+            raise fur2mid.FurFormatError("The sequence became empty after removing isolated one-tick gaps")
 
-        # A pattern slot referenced by multiple orders cannot be compacted
-        # independently because Furnace stores one shared pattern block. Keep
-        # those order segments intact rather than changing every occurrence or
-        # placing a jump/stop marker that would fire too early.
-        pattern_use_count: Dict[Tuple[int, int], int] = {}
-        for source_segment in analysis.segments:
-            source_order = int(source_segment["order"])
+        dropped_empty_ticks = len(set(reversed_states) & removed_empty_states)
+        single_tick_gaps_removed = len(isolated_empty_states)
+        _log(log, "Removed %d isolated one-tick gap(s); preserved multi-tick rests." % single_tick_gaps_removed)
+        if boundary_trim_rows:
+            _log(log, "Trimmed %d empty/navigation-only tick(s) from the reversed beginning." % boundary_trim_rows)
+
+        # Repack the flattened reversed stream into ordinary full-length
+        # pattern blocks. This is the key fix: there are no partial source-order
+        # boundaries left that would require generated 0Dxx interrupts.
+        output_order_count = (len(output_source_states) + pattern_len - 1) // pattern_len
+        if output_order_count > seq_len:
+            raise fur2mid.FurFormatError(
+                "The reversed sequence requires %d orders but the Furnace module has only %d." %
+                (output_order_count, seq_len)
+            )
+        _log(log, "Repacked %d ticks into %d order(s) of %d rows; no automatic 0Dxx breaks are required." % (
+            len(output_source_states), output_order_count, pattern_len))
+
+        # Reuse existing first-subsong pattern indexes where possible, then
+        # allocate free IDs. New IDs are appended to the Furnace pointer table
+        # by apply_sequence(); this works even when a song reuses one pattern
+        # index for many orders.
+        chosen_indices: List[List[int]] = []
+        for channel in range(song.channel_count):
+            candidates: List[int] = []
+            seen_indices = set()
+            for segment in reversed_source_segments:
+                source_order = int(segment["order"])
+                candidate = original_orders[channel][source_order]
+                if (channel, candidate) in patterns_by_key and candidate not in seen_indices:
+                    candidates.append(candidate)
+                    seen_indices.add(candidate)
+            for (pattern_channel, candidate) in sorted(patterns_by_key):
+                if pattern_channel == channel and candidate not in seen_indices:
+                    candidates.append(candidate)
+                    seen_indices.add(candidate)
+            for candidate in range(256):
+                if len(candidates) >= output_order_count:
+                    break
+                if candidate not in seen_indices:
+                    candidates.append(candidate)
+                    seen_indices.add(candidate)
+            if len(candidates) < output_order_count:
+                raise fur2mid.FurFormatError(
+                    "Channel %d has no available Furnace pattern IDs for repacking %d output orders." %
+                    (channel + 1, output_order_count)
+                )
+            chosen_indices.append(candidates[:output_order_count])
+
+        # Preserve original pattern docs so source checksums and unused patterns
+        # remain available for audit. Selected IDs are replaced by repacked
+        # sequence blocks; missing selected IDs are added as new patterns.
+        pattern_doc_map = dict(patterns_by_key)
+        for channel in range(song.channel_count):
+            for chunk_index in range(output_order_count):
+                target_index = chosen_indices[channel][chunk_index]
+                key = (channel, target_index)
+                existing = pattern_doc_map.get(key)
+                if existing is None:
+                    new_doc = {
+                        "subsong": 0,
+                        "channel": channel,
+                        "index": target_index,
+                        "name": "RevFUR Reversed %02X" % chunk_index,
+                        "rows": [],
+                    }
+                    original_pattern_docs.append(new_doc)
+                    pattern_doc_map[key] = new_doc
+                else:
+                    existing["name"] = "RevFUR Reversed %02X" % chunk_index
+                    existing["rows"] = []
+
+        # Every source flow command is discarded from the reversed pass and
+        # replaced only by a final stop/loop marker when one is required.
+        removed_flow = {key: int(analysis.flow_counts.get(key, 0)) for key in ("0B", "0D", "FF")}
+        for tick_index, (source_order, source_row) in enumerate(output_source_states):
+            chunk_index, target_row = divmod(tick_index, pattern_len)
             for channel in range(song.channel_count):
-                pattern_key = (channel, original_orders[channel][source_order])
-                if pattern_key in patterns_by_key:
-                    pattern_use_count[pattern_key] = pattern_use_count.get(pattern_key, 0) + 1
-        shared_pattern_keys = {key for key, count in pattern_use_count.items() if count > 1}
-
-        # Build a row map for each output order. Every retained tick receives a
-        # contiguous row index, so no isolated one-tick blank is left between
-        # musical events. Longer silent runs are deliberately preserved.
-        # Shared-pattern segments are kept intact as a safety fallback.
-        reversed_segments = []
-        transform_by_key: Dict[Tuple[int, int], Tuple[int, int, Tuple[Tuple[int, int], ...]]] = {}
-        applied_removed_states = set()
-        for segment in reversed_source_segments:
-            order_index = int(segment["order"])
-            start_row = int(segment["start_row"])
-            end_row = int(segment["end_row"])
-            segment_keys = {
-                (channel, original_orders[channel][order_index])
-                for channel in range(song.channel_count)
-            }
-            compact_segment = not any(key in shared_pattern_keys for key in segment_keys)
-            row_map: Dict[int, int] = {}
-            for source_row in range(end_row, start_row - 1, -1):
-                if compact_segment and (order_index, source_row) in removed_empty_states:
-                    applied_removed_states.add((order_index, source_row))
+                source_pattern_index = original_orders[channel][source_order]
+                source_item = row_lookup_by_key.get((channel, source_pattern_index), {}).get(source_row)
+                if source_item is None:
                     continue
-                row_map[source_row] = len(row_map)
-            if not row_map:
-                _log(log, "Skipped fully empty order segment %02X during compaction." % order_index)
-                continue
-            out_segment = dict(segment)
-            out_segment["row_map"] = row_map
-            out_segment["output_length"] = len(row_map)
-            reversed_segments.append(out_segment)
-            map_signature = tuple(sorted(row_map.items()))
-            for channel in range(song.channel_count):
-                key = (channel, original_orders[channel][order_index])
-                signature = (start_row, end_row, map_signature)
-                previous = transform_by_key.get(key)
-                if previous is not None and previous != signature:
-                    raise fur2mid.FurFormatError(
-                        "Cannot safely compact channel %d pattern %02X: it is reused with a different "
-                        "one-tick gap layout. Clone the shared pattern in Furnace first." % (channel + 1, key[1])
-                    )
-                transform_by_key[key] = signature
-
-        if not reversed_segments:
-            raise fur2mid.FurFormatError("Compacting empty ticks removed the entire playable sequence")
-
-        dropped_empty_ticks = len(applied_removed_states)
-        single_tick_gaps_removed = len(applied_removed_states & isolated_empty_states)
-        skipped_shared = len(removed_empty_states - applied_removed_states)
-        if skipped_shared:
-            _log(log, "Preserved %d candidate empty tick(s) in shared pattern slots; compacting those slots would alter another order occurrence." % skipped_shared)
-        removed_flow = {"0B": 0, "0D": 0, "FF": 0}
-        changed_rows = 0
-        changed_patterns = 0
-        for key, signature in transform_by_key.items():
-            pattern_doc = patterns_by_key.get(key)
-            if pattern_doc is None:
-                continue
-            start_row, end_row, map_signature = signature
-            row_map = dict(map_signature)
-            original_rows = pattern_doc.get("rows", [])
-            reversed_rows = []
-            for row_doc in original_rows:
-                source_row = int(row_doc["row"])
-                if source_row < start_row or source_row > end_row:
-                    continue
-                target_row = row_map.get(source_row)
-                if target_row is None:
-                    for effect in row_doc.get("effects", []):
-                        command = _parse_hex_value(effect.get("command"), "effect command", 0xFFFF)
-                        low = command & 0xFF
-                        if low in (0x0B, 0x0D, 0xFF):
-                            removed_flow["%02X" % low] += 1
-                    continue
-                new_row = dict(row_doc)
-                new_row["row"] = target_row
+                new_item = dict(source_item)
+                new_item["row"] = target_row
                 kept_effects = []
-                for effect in row_doc.get("effects", []):
+                for effect in source_item.get("effects", []):
                     command = _parse_hex_value(effect.get("command"), "effect command", 0xFFFF)
                     low = command & 0xFF
                     if low in (0x0B, 0x0D, 0xFF):
-                        removed_flow["%02X" % low] += 1
                         continue
-                    kept_effects.append(effect)
-                if "effects" in new_row:
-                    if kept_effects:
-                        new_row["effects"] = kept_effects
                     else:
-                        new_row.pop("effects", None)
-                reversed_rows.append(new_row)
-            reversed_rows.sort(key=lambda item: int(item["row"]))
-            if reversed_rows != original_rows:
-                changed_patterns += 1
-            changed_rows += len(reversed_rows)
-            pattern_doc["rows"] = reversed_rows
-        # Reverse only the order positions Furnace actually plays before the
-        # detected loop/end. Unreachable tail orders are padded with pattern 00.
-        seq["orders"] = []
-        for channel in range(song.channel_count):
-            used = [original_orders[channel][int(segment["order"])] for segment in reversed_segments]
-            seq["orders"].append(used + [0] * (seq_len - len(used)))
+                        kept_effects.append(dict(effect))
+                if kept_effects:
+                    new_item["effects"] = kept_effects
+                else:
+                    new_item.pop("effects", None)
+                meaningful = any(field in new_item for field in (
+                    "note", "instrument", "volume", "raw_frequency", "effects"
+                ))
+                if meaningful:
+                    target_key = (channel, chosen_indices[channel][chunk_index])
+                    pattern_doc_map[target_key]["rows"].append(new_item)
 
-        # Restore active instrument and volume state on reversed note rows.
+        # Restore active instrument/volume state in the actual reversed
+        # playback order, after all source rows have been mapped into new blocks.
         inserted_instruments = 0
         inserted_volumes = 0
         for channel in range(song.channel_count):
             active_instrument: Optional[int] = None
             active_volume: Optional[int] = None
-            for segment in reversed_segments:
-                pattern_index = original_orders[channel][int(segment["order"])]
-                pattern_doc = patterns_by_key.get((channel, pattern_index))
-                if pattern_doc is None:
+            for tick_index, (source_order, source_row) in enumerate(output_source_states):
+                chunk_index, target_row = divmod(tick_index, pattern_len)
+                target_key = (channel, chosen_indices[channel][chunk_index])
+                target_doc = pattern_doc_map[target_key]
+                target_item = next((item for item in target_doc["rows"]
+                                    if int(item["row"]) == target_row), None)
+                if target_item is None:
                     continue
-                row_lookup = {int(item["row"]): item for item in pattern_doc.get("rows", [])}
-                start_row, end_row = int(segment["start_row"]), int(segment["end_row"])
-                row_map = segment["row_map"]
-                for source_row in range(end_row, start_row - 1, -1):
-                    target_row = row_map.get(source_row)
-                    if target_row is None:
-                        continue
-                    item = row_lookup.get(target_row)
-                    if item is None:
-                        continue
-                    if "instrument" in item:
-                        active_instrument = int(item["instrument"])
-                    if "volume" in item:
-                        active_volume = int(item["volume"])
-                    note = item.get("note")
-                    if not _is_note_event(note):
-                        continue
-                    target_instrument, target_volume = desired_state.get(
-                        (channel, pattern_index, source_row), (None, None)
+                if "instrument" in target_item:
+                    active_instrument = int(target_item["instrument"])
+                if "volume" in target_item:
+                    active_volume = int(target_item["volume"])
+                if not _is_note_event(target_item.get("note")):
+                    continue
+                source_pattern_index = original_orders[channel][source_order]
+                expected_instrument, expected_volume = desired_state.get(
+                    (channel, source_pattern_index, source_row), (None, None)
+                )
+                if expected_instrument is not None and active_instrument != expected_instrument:
+                    target_item["instrument"] = expected_instrument
+                    active_instrument = expected_instrument
+                    inserted_instruments += 1
+                elif expected_instrument is None and active_instrument is not None:
+                    raise fur2mid.FurFormatError(
+                        "Cannot safely reverse channel %d: a source note had no active instrument, "
+                        "but the repacked sequence would inherit instrument %d." %
+                        (channel + 1, active_instrument)
                     )
-                    if target_instrument is not None and active_instrument != target_instrument:
-                        item["instrument"] = target_instrument
-                        active_instrument = target_instrument
-                        inserted_instruments += 1
-                    elif target_instrument is None and active_instrument is not None:
-                        raise fur2mid.FurFormatError(
-                            "Cannot safely reverse channel %d: an original note had no active instrument, "
-                            "but the reversed state would inherit instrument %d." % (channel + 1, active_instrument)
-                        )
-                    if target_volume is not None and active_volume != target_volume:
-                        item["volume"] = target_volume
-                        active_volume = target_volume
-                        inserted_volumes += 1
-                    elif target_volume is None and active_volume is not None:
-                        raise fur2mid.FurFormatError(
-                            "Cannot safely reverse channel %d: an original note had no active volume, "
-                            "but the reversed state would inherit volume %d." % (channel + 1, active_volume)
-                        )
+                if expected_volume is not None and active_volume != expected_volume:
+                    target_item["volume"] = expected_volume
+                    active_volume = expected_volume
+                    inserted_volumes += 1
+                elif expected_volume is None and active_volume is not None:
+                    raise fur2mid.FurFormatError(
+                        "Cannot safely reverse channel %d: a source note had no active volume, "
+                        "but the repacked sequence would inherit volume %d." %
+                        (channel + 1, active_volume)
+                    )
 
-        # Recreate row-level segment boundaries with 0D00. The final marker
-        # is either FF00 (finite output) or 0B00 (loop the reversed song back to
-        # order 00 / row 00). A global flow effect must be placed on a pattern
-        # that is unique to that output order; otherwise it would fire early.
+        # Sort repacked rows and make sure every output order points at a
+        # unique pattern ID. Unplayed tail orders are padded with pattern 00.
+        for channel in range(song.channel_count):
+            for chunk_index in range(output_order_count):
+                target_doc = pattern_doc_map[(channel, chosen_indices[channel][chunk_index])]
+                target_doc["rows"].sort(key=lambda item: int(item["row"]))
+            seq["orders"][channel] = chosen_indices[channel] + [0] * (seq_len - output_order_count)
+
+        # Only the final tick needs a flow marker. Complete intermediate chunks
+        # play naturally to their final row, so no 0Dxx is written at order
+        # boundaries. If the output fills the entire order table, finite output
+        # can also terminate naturally without FF00.
+        final_chunk_length = len(output_source_states) - (output_order_count - 1) * pattern_len
         flow_markers_inserted = {"0D": 0, "FF": 0, "0B": 0}
+        if loop_back_to_start:
+            final_marker = "0B"
+        elif output_order_count == seq_len and final_chunk_length == pattern_len:
+            final_marker = None
+        else:
+            final_marker = "FF"
 
-        def segment_pattern_is_unique(channel: int, pattern_index: int,
-                                      segment_position: int) -> bool:
-            return sum(
-                1 for position, segment in enumerate(reversed_segments)
-                if original_orders[channel][int(segment["order"])] == pattern_index
-            ) == 1
-
-        def insert_flow_marker(segment: Dict[str, int], command: str,
-                               output_order_index: int) -> None:
-            source_order = int(segment["order"])
-            marker_row = int(segment["output_length"]) - 1
-            for marker_channel in range(song.channel_count):
-                pattern_index = original_orders[marker_channel][source_order]
-                if not segment_pattern_is_unique(marker_channel, pattern_index, output_order_index):
-                    continue
-                pattern_doc = patterns_by_key.get((marker_channel, pattern_index))
-                if pattern_doc is None:
-                    continue
-                row_item = next((item for item in pattern_doc.get("rows", [])
+        if final_marker is not None:
+            final_chunk = output_order_count - 1
+            marker_row = final_chunk_length - 1
+            marker_placed = False
+            candidates = sorted(
+                range(song.channel_count),
+                key=lambda channel: len(next((item.get("effects", [])
+                    for item in pattern_doc_map[(channel, chosen_indices[channel][final_chunk])]["rows"]
+                    if int(item["row"]) == marker_row), [])),
+            )
+            for channel in candidates:
+                target_doc = pattern_doc_map[(channel, chosen_indices[channel][final_chunk])]
+                row_item = next((item for item in target_doc["rows"]
                                  if int(item["row"]) == marker_row), None)
                 if row_item is None:
                     row_item = {"row": marker_row}
-                    pattern_doc["rows"].append(row_item)
-                    pattern_doc["rows"].sort(key=lambda item: int(item["row"]))
+                    target_doc["rows"].append(row_item)
+                    target_doc["rows"].sort(key=lambda item: int(item["row"]))
                 effects = list(row_item.get("effects", []))
-                already_present = any(
-                    (_parse_hex_value(effect.get("command"), "effect command", 0xFFFF) & 0xFF)
-                    == int(command, 16)
-                    and _parse_hex_value(effect.get("value"), "effect value", 0xFFFF) == 0
-                    for effect in effects
-                )
-                if already_present:
-                    return
-                max_effects = (song.subsong.effect_columns[marker_channel]
-                               if marker_channel < len(song.subsong.effect_columns) else 1)
+                max_effects = (song.subsong.effect_columns[channel]
+                               if channel < len(song.subsong.effect_columns) else 1)
                 if len(effects) < max_effects:
-                    effects.append({"command": command, "value": "00"})
+                    effects.append({"command": final_marker, "value": "00"})
                     row_item["effects"] = effects
-                    flow_markers_inserted[command] += 1
-                    _log(log, "Inserted %s00 marker on channel %d at reversed order %02X row %02X." % (
-                        command, marker_channel + 1, output_order_index, marker_row))
-                    return
-            raise fur2mid.FurFormatError(
-                "Cannot place the automatic %s00 marker safely: no unique output pattern has a free effect column. "
-                "The pattern would trigger the jump before the final order, or all effect columns are occupied." % command
-            )
+                    flow_markers_inserted[final_marker] += 1
+                    _log(log, "Inserted %s00 at output order %02X row %02X on channel %d." % (
+                        final_marker, final_chunk, marker_row, channel + 1))
+                    marker_placed = True
+                    break
+            if not marker_placed:
+                raise fur2mid.FurFormatError(
+                    "Cannot place the final %s00 marker: every channel has all effect columns occupied "
+                    "on the final output tick. Free one effect column on that tick and retry." % final_marker
+                )
 
-        for output_order_index, segment in enumerate(reversed_segments[:-1]):
-            segment_length = int(segment["output_length"])
-            if segment_length < pattern_len:
-                insert_flow_marker(segment, "0D", output_order_index)
-        final_segment_length = int(reversed_segments[-1]["output_length"])
-        # A full-length final segment at the final order already ends naturally.
-        # Avoid adding FF00 to a pattern shared with an earlier order, where it
-        # would stop playback prematurely.
-        if loop_back_to_start:
-            final_marker = "0B"
-            insert_flow_marker(reversed_segments[-1], final_marker, len(reversed_segments) - 1)
-        else:
-            final_marker = "FF"
-            try:
-                insert_flow_marker(reversed_segments[-1], final_marker, len(reversed_segments) - 1)
-            except fur2mid.FurFormatError:
-                # If the final order is a complete pattern and occupies the
-                # final order-table slot, the tracker already ends naturally.
-                # In that safe case an explicit FF marker is unnecessary.
-                if final_segment_length == pattern_len and len(reversed_segments) == seq_len:
-                    final_marker = None
-                    _log(log, "Final full-length order uses the natural order-table end; no FF marker is needed.")
-                else:
-                    raise
-
-        _log(log, "Inserted %d instrument references and %d volume values to retain the original note states." % (
-            inserted_instruments, inserted_volumes))
-        _log(log, "Removed navigation effects only from the played path: 0B=%d, 0D=%d, FF=%d." % (
-            removed_flow["0B"], removed_flow["0D"], removed_flow["FF"]))
-
+        seq["patterns"] = original_pattern_docs
         output_path = Path(output_path) if output_path is not None else input_path.with_name(
             input_path.stem + "_reversed.fur"
         )
         if output_path.resolve() == input_path.resolve():
             raise fur2mid.FurFormatError("Output .fur path must be different from the original module")
-
         sequence_path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n",
                                  encoding="utf-8")
         report = apply_sequence(input_path, sequence_path, output_path, log)
 
-    # Confirm the requested end behaviour after writing the module.
     output_layout = inspect_fur(output_path)
     output_analysis = analyze_playback(output_layout)
     if loop_back_to_start:
@@ -1606,46 +1654,74 @@ def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None
                             and output_analysis.loop_start == (0, 0)
                             and output_analysis.flow_counts.get("0B", 0) >= 1)
         expected_end_description = "a 0B00 loop back to order 00 / row 00"
+    elif final_marker is None:
+        valid_output_end = output_analysis.termination == "natural_end"
+        expected_end_description = "the natural order-table end"
     else:
-        expects_explicit_stop = final_marker is not None
-        valid_output_end = (
-            output_analysis.termination == "explicit_stop" if expects_explicit_stop
-            else output_analysis.termination == "natural_end"
-        )
-        expected_end_description = (
-            "the generated FF00 stop marker" if expects_explicit_stop
-            else "the natural end of the final full-length order"
-        )
-    expected_output_rows = sum(int(segment["output_length"]) for segment in reversed_segments)
+        valid_output_end = output_analysis.termination == "explicit_stop"
+        expected_end_description = "the generated FF00 stop marker"
+
+    expected_output_rows = len(output_source_states)
     if len(output_analysis.states) != expected_output_rows:
         Path(output_path).unlink(missing_ok=True)
         raise fur2mid.FurFormatError(
-            "Post-write playback length mismatch: expected %d compacted rows, got %d." %
+            "Post-write playback length mismatch: expected %d packed ticks, got %d." %
             (expected_output_rows, len(output_analysis.states))
         )
     output_single_empty_ticks = count_isolated_empty_ticks(output_layout, output_analysis.states)
-    if output_single_empty_ticks and not shared_pattern_keys:
+    if compact_empty_ticks and output_single_empty_ticks:
         Path(output_path).unlink(missing_ok=True)
         raise fur2mid.FurFormatError(
             "Post-write validation found %d isolated empty tick(s); refusing to emit a sequence with one-tick gaps." %
             output_single_empty_ticks
         )
-    if output_single_empty_ticks and shared_pattern_keys:
-        _log(log, "Warning: %d isolated empty tick(s) remain because the affected Furnace pattern slots are shared by multiple orders and cannot be compacted safely without cloning." % output_single_empty_ticks)
+    if output_analysis.flow_counts.get("0D", 0) != 0:
+        Path(output_path).unlink(missing_ok=True)
+        raise fur2mid.FurFormatError(
+            "Post-write validation found an unexpected 0Dxx pattern break in the repacked output."
+        )
     if not valid_output_end:
         Path(output_path).unlink(missing_ok=True)
         raise fur2mid.FurFormatError(
             "Post-write playback analysis did not find %s." % expected_end_description
         )
 
+    # Compare musical note counts per channel before and after the reversal.
+    # This catches accidental event loss when rows are repacked across source
+    # order boundaries, regardless of whether the source used 0Dxx.
+    source_note_counts = [0] * song.channel_count
+    output_note_counts = [0] * song.channel_count
+    for order, source_row in analysis.states:
+        for channel in range(song.channel_count):
+            pattern_index = original_orders[channel][order]
+            cell = song.subsong.patterns.get((channel, pattern_index))
+            cell = cell.rows.get(source_row) if cell is not None else None
+            if cell is not None and _is_note_event(cell.note):
+                source_note_counts[channel] += 1
+    out_song = output_layout.song
+    for order, output_row in output_analysis.states:
+        for channel in range(song.channel_count):
+            pattern_index = out_song.subsong.orders[channel][order]
+            pattern = out_song.subsong.patterns.get((channel, pattern_index))
+            cell = pattern.rows.get(output_row) if pattern is not None else None
+            if cell is not None and _is_note_event(cell.note):
+                output_note_counts[channel] += 1
+    if source_note_counts != output_note_counts:
+        Path(output_path).unlink(missing_ok=True)
+        raise fur2mid.FurFormatError(
+            "Post-write validation found a per-channel note-count mismatch: source=%s output=%s." %
+            (source_note_counts, output_note_counts)
+        )
+
     report.update({
         "operation": "reverse_entire_sequence",
         "playback_analysis": analysis.as_dict(),
         "output_playback_analysis": output_analysis.as_dict(),
-        "order_positions_reversed": len(analysis.segments),
+        "order_positions_reversed": output_order_count,
+        "source_playback_segments": len(analysis.segments),
         "channels_reversed_together": song.channel_count,
-        "pattern_rows_mirrored": changed_rows,
-        "patterns_reversed": changed_patterns,
+        "pattern_rows_mirrored": len(output_source_states),
+        "patterns_reversed": output_order_count * song.channel_count,
         "instrument_references_inserted": inserted_instruments,
         "volume_values_inserted": inserted_volumes,
         "navigation_effects_removed": removed_flow,
@@ -1655,23 +1731,53 @@ def reverse_entire_sequence(input_path: Path, output_path: Optional[Path] = None
         "loop_marker_inserted": final_marker == "0B",
         "flow_markers_inserted": flow_markers_inserted,
         "initial_navigation_tick_trimmed": bool(boundary_trim_rows),
+        "trim_boundary_empty_ticks_enabled": bool(trim_boundary_empty_ticks),
         "initial_navigation_tick_shift_rows": boundary_trim_rows,
         "isolated_empty_ticks_removed": dropped_empty_ticks,
         "single_tick_gaps_removed": single_tick_gaps_removed,
-        "single_tick_empty_ticks_preserved_shared": output_single_empty_ticks,
-        "single_tick_gap_compaction_complete": output_single_empty_ticks == 0,
-        "output_playback_rows_expected": sum(int(segment["output_length"]) for segment in reversed_segments),
+        "single_tick_empty_ticks_preserved_shared": 0,
+        "single_tick_gap_compaction_complete": bool(compact_empty_ticks),
+        "empty_tick_compaction_enabled": bool(compact_empty_ticks),
+        "output_playback_rows_expected": expected_output_rows,
+        "source_note_counts_by_channel": source_note_counts,
+        "output_note_counts_by_channel": output_note_counts,
+        "automatic_0D_insertions": 0,
         "reverse_policy": (
-            "Automatically simulated Furnace playback to the first detected loop, explicit FFxx stop, "
-            "or natural order-table end. Reversed the reachable pass once, removed forward navigation "
-            "effects only from played rows, removed isolated globally empty one-tick gaps across all "
-            "channels while preserving multi-tick rests, normalized each retained segment to row 00, and "
-            "inserted 0D00 between partial-pattern segments. The output ends with %s."
-        ) % ("0B00 to loop back to order 00 / row 00" if loop_back_to_start else "FF00 to stop"),
+            "Simulated Furnace playback to the first detected loop, explicit FFxx stop, "
+            "or natural order-table end; reversed the reachable tick stream; %s; "
+            "repacked the continuous result into full-length patterns; did not insert "
+            "0Dxx at order boundaries; and ended with %s."
+        ) % (
+            "removed isolated one-tick empty gaps (opt-in)" if compact_empty_ticks
+            else "preserved every tick, including one-tick empty rows (same length)",
+            "0B00 to loop back to order 00 / row 00" if loop_back_to_start
+            else "FF00 stop" if final_marker == "FF" else "the natural order-table end",
+        ),
     })
+    try:
+        expected_stream = list(reversed(_note_stream(input_path)))[boundary_trim_rows:]
+        output_stream = _note_stream(output_path)
+        mismatched = sum(1 for a, b in zip(expected_stream, output_stream) if a != b)
+        report["exact_note_verification"] = {
+            "expected_ticks": len(expected_stream),
+            "output_ticks": len(output_stream),
+            "mismatched_ticks": mismatched,
+            "matches": bool(len(expected_stream) == len(output_stream) and mismatched == 0),
+            "scope": "note values per playback tick (instrument/volume state fills are excluded)",
+        }
+    except Exception as exc:  # verification is advisory; never hide the output
+        report["exact_note_verification"] = {"error": str(exc)}
+    _log(log, "Exact note verification: %s" % (
+        "all ticks match the reversed source" if report["exact_note_verification"].get("matches")
+        else "see report exact_note_verification"))
     report_path = Path(output_path).with_suffix(".revfur-report.json")
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    _log(log, "Compacted %d isolated empty tick(s); retained multi-tick rests and preserved all non-empty row events." % dropped_empty_ticks)
+    if compact_empty_ticks:
+        _log(log, "Compacted %d isolated empty tick(s); retained multi-tick rests." % single_tick_gaps_removed)
+    else:
+        _log(log, "Preserved all ticks, including one-tick empty rows (no timing change).")
+    _log(log, "Repacked %d ticks into %d order(s); inserted 0Dxx markers: 0." % (
+        expected_output_rows, output_order_count))
     _log(log, "Reversed reachable playback path successfully.")
     output_end_description = ("0B00 loop to order 00 / row 00" if final_marker == "0B"
                               else "explicit FF00 stop" if final_marker == "FF" else "natural order-table end")

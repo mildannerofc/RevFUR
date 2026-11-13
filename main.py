@@ -315,6 +315,10 @@ def main(argv=None):
     p_reverse.add_argument("-o", "--output", help="Output reversed Furnace .fur path")
     p_reverse.add_argument("--loop-back", action="store_true",
                            help="Insert 0B00 at the end so playback loops back to order 00 / row 00")
+    p_reverse.add_argument("--keep-boundary-empty-ticks", action="store_true",
+                           help="Keep empty/navigation-only ticks at the start of the reversed song")
+    p_reverse.add_argument("--compact-empty-ticks", action="store_true",
+                           help="Also remove isolated one-tick empty rows (shortens the song; changes rhythm)")
     p_analyze = sub.add_parser("analyze", help="Detect playback loops, navigation commands and the song end")
     p_analyze.add_argument("input", help="Source Furnace .fur module")
     p_apply = sub.add_parser("apply", help="Apply an edited .furseq.json sequence to the original .fur module")
@@ -336,6 +340,8 @@ def main(argv=None):
             report = reverse_entire_sequence(
                 Path(args.input), Path(args.output) if args.output else None,
                 print, loop_back_to_start=args.loop_back,
+                compact_empty_ticks=args.compact_empty_ticks,
+                trim_boundary_empty_ticks=not args.keep_boundary_empty_ticks,
             )
             print(json_summary(report))
             return 0

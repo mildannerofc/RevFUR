@@ -18,7 +18,8 @@ RevFUR follows that useful workflow idea—inspect a binary music sequence, sepa
 - Simulates Furnace playback across all channels and detects `0Bxx` order jumps, `0Dxx` pattern breaks, `FFxx` explicit stops, repeated order/row states (loops), and natural order-table completion.
 - Reads the Furnace compatibility flags `jumpTreatment` and `ignoreJumpAtEnd`, including legacy INFO flag bytes and modern CFLG blocks.
 - Reverses only the reachable playback pass, including the introduction and one traversal of a detected infinite loop; unreachable tail orders are not blindly included.
-- Handles partial pattern segments by inserting `0D00` at reversed segment boundaries. The final output can either stop with `FF00` or loop to order `00` / row `00` with a native `0B00` jump.
+- Flattens the reachable reversed tick stream and repacks it into full-length pattern blocks. It does **not** generate `0Dxx` pattern-break commands at output order boundaries, so songs that never used `0Dxx` are not disrupted by artificial breaks.
+- Source `0Dxx` commands are simulated during playback analysis and removed from the reversed pass; the resulting musical events are repacked continuously. The output can stop with `FF00` or loop to order `00` / row `00` with native `0B00`.
 - Re-establishes stateful instrument and volume-column settings for reversed notes by inserting only missing values into sequence rows; the original instrument definitions remain byte-for-byte unchanged.
 - Re-analyzes the generated `.fur` and verifies its selected ending: an explicit `FF00`, a natural order-table end, or a `0B00` loop back to the beginning.
 - Exports the channel-major order table and every first-subsong pattern row for manual editing.
@@ -60,13 +61,13 @@ When a loop is detected, RevFUR reverses one finite pass consisting of the intro
 
 The reversal is synchronized across every channel:
 
-1. The reachable order/row segments are reversed together, including partial final orders and pattern breaks.
-2. Rows within each reachable segment are mirrored and normalized to begin at row 00. Unplayed rows outside the detected source path are excluded from the reversed arrangement.
-3. `0D00` is inserted between reversed segments that occupy only part of a Furnace pattern. At the end, RevFUR inserts `FF00` to stop, or `0B00` to loop back to order `00` / row `00` when the loop option is enabled. If the last full order already ends naturally, an extra `FF00` is unnecessary.
-4. RevFUR removes isolated globally empty one-tick gaps throughout the reachable playback pass, synchronously across all channels. Multi-tick rests are retained, as are all rows containing notes, instrument/volume changes, raw frequencies, or non-navigation effects. The output becomes shorter by the number of removed one-tick gaps; the program does not move the silence elsewhere.
-5. Pattern slots shared by multiple order positions are preserved when compacting them would affect another occurrence or make a flow marker fire early. The console and report identify any one-tick gaps left because a shared pattern cannot be safely compacted without cloning it.
+1. The reachable order/row stream is reversed across all channels, including partial orders reached through `0Dxx` and loops reached through `0Bxx`.
+2. By default RevFUR keeps every reachable tick, including one-tick empty rows, so the reversed song has exactly the same length and rhythm as the source playback path. The optional `--compact-empty-ticks` flag (CLI) removes isolated one-tick empty rows instead; this shortens the song and changes the rhythm, so it is off by default.
+3. The resulting continuous tick stream is packed into full-length output patterns. Orders advance naturally at full pattern boundaries; RevFUR does not inject `0D00` between them. A source song without `0Dxx` therefore remains free of generated pattern-break commands.
+4. If needed, RevFUR allocates unused pattern IDs and appends new `PATN`/`PATR` blocks. It extends the `INF2` or legacy `INFO` pattern-pointer table through a relocated song-info header. Existing instruments, samples, wavetables, chip settings, and their data blocks remain untouched.
+5. At the end, RevFUR inserts `FF00` to stop or `0B00` to loop back to order `00` / row `00`. If all output orders fill the order table, a finite sequence can end naturally without an extra marker.
 6. Stateful instrument and volume-column values are evaluated along the original playback path. When reversal would leave a note with a different inherited state, RevFUR inserts the required value on that note row without editing the instrument/sample data.
-7. The generated module is parsed and simulated again. The output length must match the compacted row map, the requested end/loop behavior must be correct, and no isolated one-tick empty gap may remain when the affected pattern slots can be compacted safely.
+7. The generated module is parsed and simulated again. RevFUR verifies the output tick count, per-channel note counts, absence of generated `0Dxx` commands, requested end/loop behavior, and byte-for-byte asset preservation.
 
 The **Loop output back to the beginning** option (enabled by default in the GUI) writes `0B00` at the final reversed row. Furnace then jumps to order `00`, row `00` and repeats the whole reversed arrangement indefinitely. This is a native unconditional Furnace loop; `0Bxx` does not carry a finite repeat counter. Turn the option off to use `FF00` (or the natural order-table end when that is already sufficient).
 
@@ -145,7 +146,7 @@ The document has these main fields:
 
 - `source.sha256`: identity check for the original `.fur` file. Do not edit it.
 - `sequence.orders`: one byte-value array per Furnace channel. Each value is an order's pattern index (`00`–`FF`); JSON stores these as decimal integers.
-- `sequence.patterns`: one entry per existing pattern in the first subsong.
+- `sequence.patterns`: one entry per existing pattern in the first subsong. Reverse mode may append new pattern entries when it needs more independent pattern blocks for repacking.
 - `patterns[].rows`: sparse list of non-empty pattern rows. `row` is zero-based.
 - `note`: Furnace's native note code (`0`–`179` for notes, `180` note-off, `181` release, `182` macro release, `183` raw frequency).
 - `instrument`: instrument index referenced by the sequence row. This changes only the reference in the pattern, not the instrument definition.
@@ -177,13 +178,13 @@ RevFUR is intentionally conservative:
 - It edits the first subsong only. Additional subsongs are left untouched.
 - The reverse operation targets the first subsong, as do the extraction and apply operations. Additional subsongs are left untouched.
 - If one pattern slot is reused in different orders with conflicting inherited instrument or volume-column states, reversal is rejected rather than silently producing an incorrect arrangement. Split/clone that pattern in Furnace first, then retry.
-- Manual sequence editing keeps the existing pattern rows, channels, order count, and pattern identities. This version does not add/remove channels, orders, or pattern slots.
+- Manual sequence editing keeps the existing channels, order count, and original pattern identities. Reverse mode may append new pattern blocks and extend the first-subsong pattern pointer list when it needs independent output blocks.
 - Pattern indices referenced by the order table are stored as byte values, as in the Furnace format.
 - The original module is never overwritten by default; the GUI and CLI create a separate output file.
 - Changed patterns are appended as new blocks. Original pattern blocks remain in the file, and only the pointer for each changed pattern is redirected.
 - Unmodified pattern blocks are not rewritten. A no-edit export/apply round trip preserves the decompressed module bytes exactly.
 - Instrument, sample, and wavetable asset blocks are checked byte-for-byte. A failed safety check aborts output generation.
-- A loop-back marker must be placed on a unique pattern slot with an available effect column. If every terminal-channel pattern is shared with an earlier order, RevFUR reports the conflict instead of creating an early jump.
+- The final stop/loop marker is placed in a free effect column on the final packed tick. If every channel has all effect columns occupied on that tick, RevFUR reports the conflict instead of silently truncating playback.
 
 MIDI is not involved in this tool. RevFUR preserves Furnace sequence semantics instead of converting hardware effects into MIDI approximations. In Extract/Apply mode, `0Bxx` remains an ordinary Furnace effect row; in Reverse mode it is interpreted as playback flow so the reachable loop can be identified automatically.
 
@@ -224,7 +225,7 @@ sudo apt install dpkg-dev
 ./build_deb.sh
 ```
 
-This creates `dist/revfur_0.1.5_all.deb`. The package runs the Python sources on the system interpreter and depends on `python3 (>= 3.10)` and `python3-tk`; drag-and-drop remains optional.
+This creates `dist/revfur_0.1.6_all.deb`. The package runs the Python sources on the system interpreter and depends on `python3 (>= 3.10)` and `python3-tk`; drag-and-drop remains optional.
 
 ### GitHub Actions
 
@@ -240,13 +241,14 @@ Run the regression suite:
 python -m unittest discover -s tests -v
 ```
 
-The suite contains 15 tests and covers:
+The suite contains 17 tests and covers:
 
-- Full-song reverse: synchronized order reversal across channels, isolated one-tick gap compaction, preservation of multi-tick rests, restoration of sparse instrument/volume state, navigation-marker reconstruction and optional `0B00` loop-back.
+- Full-song reverse: synchronized channel reversal, isolated one-tick gap compaction, multi-tick rest preservation, sparse instrument/volume restoration, and optional `0B00` loop-back.
 - Real Furnace v232 module (`examples/options music.fur`).
 - Legacy `INFO` / `PATN` export and no-op round trip.
 - Legacy `INFO` / `PATR` with a 16-bit effect value.
-- Modern `INF2` / `SNG2` / `PATN` and synthetic instrument/sample/wavetable blocks.
+- Modern `INF2` / `SNG2` / `PATN`, synthetic instrument/sample/wavetable blocks, and pointer-table extension for newly allocated patterns.
+- Reversal of sources with and without `0Dxx`; output is repacked without generated `0Dxx` breaks.
 - Editing a note, an effect, and the order table.
 - Refusal to apply a sequence document to a different source module.
 - Asset block identity checks.
@@ -260,3 +262,7 @@ The modern v240 test is a synthetic fixture built from the published Furnace for
 - [Furnace pattern effects](https://github.com/tildearrow/furnace/blob/master/doc/3-pattern/effects.md)
 - [Furnace instrument format](https://github.com/tildearrow/furnace/blob/master/papers/newIns.md)
 - RevSMPS reference: the supplied `RevSMPS.exe` was inspected locally; no RevSMPS source code or executable is included in this project.
+
+## Version
+
+RevFUR 0.1.6 — continuous sequence repacking without generated `0Dxx` pattern breaks, with safe pattern allocation and optional whole-song `0B00` loop-back.

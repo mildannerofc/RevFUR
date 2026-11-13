@@ -195,22 +195,21 @@ class RevFURTests(unittest.TestCase):
         module = self.work / "sparse_instrument.fur"
         make_inf2_fixture(module, loop=False)
         output = self.work / "sparse_instrument_reversed.fur"
-        report = reverse_entire_sequence(module, output)
+        report = reverse_entire_sequence(module, output, compact_empty_ticks=True)
         song = furparser.load_fur(output)
         pattern = song.subsong.patterns[(0, 0)]
 
-        # Source row 0 selects instrument 0; source row 2 only has a note.
-        # In reverse playback the row-2 note comes first, so its instrument
-        # reference must be materialised before that note is triggered.
-        self.assertEqual(pattern.rows[1].note, 62)
+        # Repacking flattens both order occurrences into one four-row pattern.
+        # The source row-2 note is now first and receives the active instrument
+        # and volume explicitly; subsequent notes retain their correct state.
+        self.assertEqual([pattern.rows[row].note for row in range(4)], [62, 60, 62, 60])
+        self.assertEqual(pattern.rows[0].instrument, 0)
+        self.assertEqual(pattern.rows[0].volume, 100)
         self.assertEqual(pattern.rows[1].instrument, 0)
         self.assertEqual(pattern.rows[1].volume, 100)
-        self.assertEqual(pattern.rows[3].note, 60)
-        self.assertEqual(pattern.rows[3].instrument, 0)
-        self.assertEqual(pattern.rows[3].volume, 100)
         self.assertGreaterEqual(report["instrument_references_inserted"], 1)
-        self.assertGreater(report["single_tick_empty_ticks_preserved_shared"], 0)
-        self.assertFalse(report["single_tick_gap_compaction_complete"])
+        self.assertEqual(report["single_tick_empty_ticks_preserved_shared"], 0)
+        self.assertTrue(report["single_tick_gap_compaction_complete"])
         self.assertTrue(report["instruments_unchanged"])
         self.assertTrue(report["samples_unchanged"])
         self.assertTrue(report["wavetables_unchanged"])
@@ -225,20 +224,21 @@ class RevFURTests(unittest.TestCase):
         report = reverse_entire_sequence(module, output)
         after = furparser.load_fur(output)
 
-        # All channel order tables are reversed in lockstep, not one channel
-        # at a time and not merely exported as an unchanged disassembly.
-        self.assertEqual(after.subsong.orders, [[1, 0]] * before.channel_count)
-        # Row zero becomes the final row of the full four-row Furnace pattern.
-        reversed_pattern = after.subsong.patterns[(0, 0)]
-        self.assertNotIn(0, reversed_pattern.rows)
+        # The full reversed stream is packed into new pattern blocks. The
+        # original note therefore lands in the final row of the second chunk;
+        # channels without source patterns receive valid empty replacement
+        # patterns so all order tables remain synchronized.
+        self.assertEqual(len(after.subsong.orders), before.channel_count)
+        self.assertEqual(len(after.subsong.orders[0]), before.subsong.orders_length)
+        final_index = after.subsong.orders[0][1]
+        reversed_pattern = after.subsong.patterns[(0, final_index)]
         self.assertEqual(reversed_pattern.rows[3].note, original_note)
-        # The new reverse is finite: it strips source navigation and adds an
-        # explicit FF00 at the exact end of the reversed reachable path.
-        self.assertFalse(any(code == 0x0B for cell in reversed_pattern.rows.values()
-                             for code, _value in cell.effects))
-        self.assertEqual(report["navigation_effects_removed"]["0B"], 0)
-        self.assertTrue(report["stop_marker_inserted"])
-        self.assertEqual(report["output_playback_analysis"]["termination"], "explicit_stop")
+        self.assertEqual(report["flow_markers_inserted"]["0D"], 0)
+        self.assertEqual(report["output_playback_analysis"]["flow_commands"]["0D"], 0)
+        # Both four-row patterns fill the order table, so the end is natural.
+        self.assertFalse(report["stop_marker_inserted"])
+        self.assertTrue(report["natural_end_used"])
+        self.assertEqual(report["output_playback_analysis"]["termination"], "natural_end")
         self.assertTrue(report["instruments_unchanged"])
         self.assertTrue(report["samples_unchanged"])
         self.assertTrue(report["wavetables_unchanged"])
@@ -283,14 +283,16 @@ class RevFURTests(unittest.TestCase):
         self.assertEqual(source_analysis.loop_start, (2, 0))
         self.assertEqual(source_analysis.loop_end, (4, 31))
         output = self.work / "sample_reversed.fur"
-        report = reverse_entire_sequence(module, output)
+        report = reverse_entire_sequence(module, output, compact_empty_ticks=True)
         after = furparser.load_fur(output)
         self.assertEqual(report["playback_analysis"]["played_rows"], 280)
         self.assertEqual(report["output_playback_analysis"]["played_rows"], 215)
         self.assertEqual(report["single_tick_gaps_removed"], 65)
         output_analysis = analyze_playback(inspect_fur(output))
         self.assertEqual(count_isolated_empty_ticks(inspect_fur(output), output_analysis.states), 0)
-        self.assertGreaterEqual(report["flow_markers_inserted"]["0D"], 2)
+        self.assertEqual(report["flow_markers_inserted"]["0D"], 0)
+        self.assertEqual(report["output_playback_analysis"]["flow_commands"]["0D"], 0)
+        self.assertEqual(report["automatic_0D_insertions"], 0)
         self.assertEqual(report["output_playback_analysis"]["termination"], "explicit_stop")
         self.assertEqual(after.subsong.orders[0], [4, 3, 2, 1, 0])
         # The source's final played row (order 4, row 31) is only a 0B loop
@@ -365,10 +367,35 @@ class RevFURTests(unittest.TestCase):
                          report["playback_analysis"]["flow_commands"]["0B"])
         self.assertEqual(output_analysis.states[0], (0, 0))
         self.assertEqual(len(output_analysis.states), report["output_playback_rows_expected"])
-        self.assertEqual(count_isolated_empty_ticks(inspect_fur(output), output_analysis.states), 0)
         self.assertTrue(report["instruments_unchanged"])
         self.assertTrue(report["samples_unchanged"])
         self.assertTrue(report["wavetables_unchanged"])
+
+    def test_default_reverse_preserves_every_tick_and_timing(self):
+        module = ROOT / "examples" / "mcc attempt S3 drums_revfur.fur"
+        if not module.exists():
+            self.skipTest("Loop regression sample is not available in this checkout")
+        output = self.work / "sample_preserved.fur"
+        report = reverse_entire_sequence(module, output)
+        self.assertFalse(report["empty_tick_compaction_enabled"])
+        self.assertEqual(report["single_tick_gaps_removed"], 0)
+        trimmed = report["initial_navigation_tick_shift_rows"]
+        self.assertEqual(report["output_playback_rows_expected"],
+                         report["playback_analysis"]["played_rows"] - trimmed)
+        self.assertTrue(report["exact_note_verification"]["matches"])
+        self.assertTrue(report["instruments_unchanged"])
+
+    def test_boundary_trim_is_opt_out_and_keeps_interior_ticks(self):
+        module = ROOT / "examples" / "mcc attempt S3 drums_revfur.fur"
+        if not module.exists():
+            self.skipTest("Loop regression sample is not available in this checkout")
+        kept = reverse_entire_sequence(module, self.work / "kept.fur", trim_boundary_empty_ticks=False)
+        self.assertEqual(kept["initial_navigation_tick_shift_rows"], 0)
+        trimmed = reverse_entire_sequence(module, self.work / "trimmed.fur")
+        self.assertEqual(kept["output_playback_rows_expected"]
+                         - trimmed["output_playback_rows_expected"],
+                         trimmed["initial_navigation_tick_shift_rows"])
+        self.assertTrue(trimmed["exact_note_verification"]["matches"])
 
     def test_single_empty_tick_compaction_only_removes_isolated_gaps(self):
         patterns = {
@@ -386,6 +413,50 @@ class RevFURTests(unittest.TestCase):
             find_isolated_empty_ticks(states, patterns, [[0]], 1),
             {(0, 1), (0, 6)},
         )
+
+    def test_reverse_without_source_0d_does_not_generate_pattern_breaks_and_extends_inf2_table(self):
+        module = self.work / "modern_no_0d.fur"
+        make_inf2_fixture(module, loop=False)
+        sequence, _ = export_sequence(module, self.work / "modern_no_0d.furseq.json")
+        doc = json.loads(sequence.read_text(encoding="utf-8"))
+        pattern = next(p for p in doc["sequence"]["patterns"] if p["channel"] == 0 and p["index"] == 0)
+        # Eight adjacent notes across two uses of one pattern force the reverse
+        # operation to allocate a second pattern block in the INF2 pointer list.
+        pattern["rows"] = [
+            {"row": row, "note": 60 + row, "instrument": 0, "volume": 100}
+            for row in range(4)
+        ]
+        sequence.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        edited = self.work / "modern_no_0d_dense.fur"
+        apply_sequence(module, sequence, edited)
+
+        output = self.work / "modern_no_0d_reversed.fur"
+        report = reverse_entire_sequence(edited, output)
+        output_layout = inspect_fur(output)
+        output_analysis = analyze_playback(output_layout)
+        song = furparser.load_fur(output)
+
+        self.assertEqual(report["playback_analysis"]["flow_commands"]["0D"], 0)
+        self.assertEqual(report["automatic_0D_insertions"], 0)
+        self.assertEqual(output_analysis.flow_counts["0D"], 0)
+        self.assertEqual(report["patterns_added"], 1)
+        self.assertEqual(len(output_layout.pattern_ptrs), 2)
+        self.assertEqual(len(output_analysis.states), 8)
+        self.assertEqual(song.subsong.orders[0][:2], [0, 1])
+        self.assertEqual(report["source_note_counts_by_channel"], report["output_note_counts_by_channel"])
+
+    def test_reverse_source_with_0d_is_flattened_without_new_0d_interruptions(self):
+        module = self.work / "source_with_0d.fur"
+        make_inf2_fixture(module, loop=False, pattern_break=True)
+        source_analysis = analyze_playback(inspect_fur(module))
+        self.assertEqual(source_analysis.flow_counts["0D"], 1)
+        output = self.work / "source_with_0d_reversed.fur"
+        report = reverse_entire_sequence(module, output)
+        output_analysis = analyze_playback(inspect_fur(output))
+        self.assertEqual(report["navigation_effects_removed"]["0D"], 1)
+        self.assertEqual(report["flow_markers_inserted"]["0D"], 0)
+        self.assertEqual(output_analysis.flow_counts["0D"], 0)
+        self.assertEqual(len(output_analysis.states), report["output_playback_rows_expected"])
 
     def test_wrong_source_is_rejected(self):
         module = self.work / "source.fur"
